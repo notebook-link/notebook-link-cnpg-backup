@@ -110,10 +110,8 @@ jobs:
   # Manual deployment for specific environments
   deploy-manual:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Deploy to selected environment
-        uses: ./.github/workflows/reusable-deploy.yaml
-        with:
-          environment_stage: ${{ github.event.inputs.environment_stage }}
-          version_number: "manual"
+    uses: ./.github/workflows/reusable-deploy.yaml
+    with:
+      environment_stage: ${{ github.event.inputs.environment_stage }}
+      version_number: "manual"
+    secrets: inherit
