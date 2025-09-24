@@ -59,6 +59,9 @@ jobs:
           curl -o /usr/local/bin/scw -L "https://github.com/scaleway/scaleway-cli/releases/download/v2.26.0/scaleway-cli_2.26.0_linux_amd64"
           chmod +x /usr/local/bin/scw
 
+          # Create config directory
+          mkdir -p $HOME/.config/scw
+
           # Configure Scaleway CLI
           scw config set access-key=${{ secrets.TF_MANAGED_SCALEWAY_APP_ACCESS_KEY }}
           scw config set secret-key=${{ secrets.TF_MANAGED_SCALEWAY_APP_SECRET_KEY }}
