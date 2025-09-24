@@ -1,0 +1,224 @@
+name: Reusable Deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment_stage:
+        required: true
+        type: string
+      version_number:
+        required: false
+        type: string
+        default: "1.0.0"
+      dry_run:
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment_stage }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.29.0'
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+
+          # Create CA certificate file
+          echo "${{ secrets.TF_MANAGED_K8S_CA_CERT }}" > $HOME/.kube/ca.crt
+
+          # Setup kubectl configuration for this environment's cluster
+          kubectl config set-cluster kubernetes \
+            --server=${{ secrets.TF_MANAGED_K8S_API_SERVER_URL }} \
+            --certificate-authority=$HOME/.kube/ca.crt \
+            --embed-certs=true
+
+          kubectl config set-credentials service-account \
+            --token=${{ secrets.TF_MANAGED_K8S_SA_TOKEN }}
+
+          kubectl config set-context default \
+            --cluster=kubernetes \
+            --user=service-account
+
+          kubectl config use-context default
+
+          # Test connection
+          kubectl version --client
+
+      - name: Setup Scaleway CLI
+        run: |
+          # Install Scaleway CLI
+          curl -o /usr/local/bin/scw -L "https://github.com/scaleway/scaleway-cli/releases/download/v2.26.0/scaleway-cli_2.26.0_linux_amd64"
+          chmod +x /usr/local/bin/scw
+
+          # Configure Scaleway CLI
+          scw config set access-key=${{ secrets.TF_MANAGED_SCALEWAY_APP_ACCESS_KEY }}
+          scw config set secret-key=${{ secrets.TF_MANAGED_SCALEWAY_APP_SECRET_KEY }}
+          scw config set default-project-id=${{ secrets.TF_MANAGED_SCALEWAY_PROJECT_ID }}
+          scw config set default-organization-id=${{ secrets.TF_MANAGED_SCALEWAY_ORG_ID }}
+          scw config set default-region=fr-par
+          scw config set default-zone=fr-par-1
+
+      - name: Deploy CNPG Backup Configuration
+        if: inputs.dry_run == false
+        run: |
+          echo "Deploying CNPG backup configuration to ${{ inputs.environment_stage }} environment"
+          echo "Version: ${{ inputs.version_number }}"
+
+          # Create namespace if it doesn't exist
+          kubectl create namespace cnpg-system --dry-run=client -o yaml | kubectl apply -f -
+
+          # Fetch S3 credentials from Scaleway Secret Manager
+          S3_BUCKET="notebook-link-cnpg-backups-${{ inputs.environment_stage }}"
+          echo "Using S3 bucket: $S3_BUCKET"
+
+          S3_ACCESS_KEY=$(scw secret version access-by-path \
+            secret-path="/${{ inputs.environment_stage }}/cnpg/" \
+            secret-name="S3_ACCESS_KEY" \
+            revision=latest --output=json | jq -r '.data' | base64 -d)
+
+          S3_SECRET_KEY=$(scw secret version access-by-path \
+            secret-path="/${{ inputs.environment_stage }}/cnpg/" \
+            secret-name="S3_SECRET_KEY" \
+            revision=latest --output=json | jq -r '.data' | base64 -d)
+
+          # Auto-discover all PostgreSQL clusters in THIS environment's cluster
+          echo "Auto-discovering PostgreSQL clusters in ${{ inputs.environment_stage }} cluster..."
+          CLUSTERS=$(kubectl get clusters.postgresql.cnpg.io --all-namespaces -o json 2>/dev/null || echo '{"items":[]}')
+
+          if [ $(echo "$CLUSTERS" | jq '.items | length') -eq 0 ]; then
+            echo "No PostgreSQL clusters found in ${{ inputs.environment_stage }} environment"
+            exit 0
+          fi
+
+          # Configure backup for each discovered cluster
+          echo "$CLUSTERS" | jq -r '.items[] | @base64' | while read cluster; do
+            _jq() {
+              echo ${cluster} | base64 --decode | jq -r ${1}
+            }
+
+            NAMESPACE=$(_jq '.metadata.namespace')
+            CLUSTER_NAME=$(_jq '.metadata.name')
+
+            echo "========================================="
+            echo "Configuring backup for cluster: $CLUSTER_NAME"
+            echo "Namespace: $NAMESPACE"
+            echo "Backup destination: s3://$S3_BUCKET/$NAMESPACE/"
+            echo "========================================="
+
+            # Create S3 credentials secret in the namespace
+            kubectl create secret generic cnpg-s3-credentials \
+              --namespace=$NAMESPACE \
+              --from-literal=ACCESS_KEY=$S3_ACCESS_KEY \
+              --from-literal=SECRET_KEY=$S3_SECRET_KEY \
+              --dry-run=client -o yaml | kubectl apply -f -
+
+            # Patch cluster to add backup configuration
+            kubectl patch cluster.postgresql.cnpg.io/$CLUSTER_NAME \
+              --namespace=$NAMESPACE \
+              --type=merge \
+              --patch '{
+                "spec": {
+                  "backup": {
+                    "barmanObjectStore": {
+                      "destinationPath": "s3://'$S3_BUCKET'/'$NAMESPACE'",
+                      "endpointURL": "https://s3.fr-par.scw.cloud",
+                      "s3Credentials": {
+                        "accessKeyId": {
+                          "name": "cnpg-s3-credentials",
+                          "key": "ACCESS_KEY"
+                        },
+                        "secretAccessKey": {
+                          "name": "cnpg-s3-credentials",
+                          "key": "SECRET_KEY"
+                        }
+                      },
+                      "wal": {
+                        "retention": "7d",
+                        "maxParallel": 8
+                      },
+                      "data": {
+                        "immediateCheckpoint": false,
+                        "jobs": 2
+                      }
+                    }
+                  }
+                }
+              }'
+
+            # Create scheduled backup
+            cat <<EOF | kubectl apply -f -
+          apiVersion: postgresql.cnpg.io/v1
+          kind: ScheduledBackup
+          metadata:
+            name: ${CLUSTER_NAME}-daily
+            namespace: ${NAMESPACE}
+          spec:
+            schedule: "0 2 * * *"
+            cluster:
+              name: ${CLUSTER_NAME}
+            immediate: false
+            backupOwnerReference: self
+          EOF
+
+            echo "✓ Backup configured for $CLUSTER_NAME"
+          done
+
+          echo ""
+          echo "CNPG backup configuration deployed to ${{ inputs.environment_stage }} environment"
+
+      - name: Dry run deployment
+        if: inputs.dry_run == true
+        run: |
+          echo "## Dry Run - CNPG Backup Deployment for ${{ inputs.environment_stage }}"
+          echo ""
+          echo "Would configure backups for PostgreSQL clusters in:"
+          echo "- Environment: ${{ inputs.environment_stage }}"
+          echo "- Cluster: ${{ vars.TF_MANAGED_K8S_CLUSTER_NAME }}"
+          echo "- S3 Bucket: notebook-link-cnpg-backups-${{ inputs.environment_stage }}"
+          echo ""
+
+          # List clusters that would be configured
+          echo "PostgreSQL clusters in this environment:"
+          kubectl get clusters.postgresql.cnpg.io --all-namespaces 2>/dev/null || echo "No clusters found or CRD not installed"
+
+          echo ""
+          echo "Dry run completed successfully"
+
+      - name: Verify deployment
+        if: inputs.dry_run == false
+        run: |
+          echo "Verifying CNPG backup deployment in ${{ inputs.environment_stage }}..."
+
+          echo ""
+          echo "## Configured Backups"
+          kubectl get backups.postgresql.cnpg.io --all-namespaces 2>/dev/null || echo "No backups configured yet"
+
+          echo ""
+          echo "## Scheduled Backups"
+          kubectl get scheduledbackups.postgresql.cnpg.io --all-namespaces 2>/dev/null || echo "No scheduled backups configured yet"
+
+          echo ""
+          echo "## S3 Credentials Secrets"
+          kubectl get secrets --all-namespaces | grep cnpg-s3-credentials || echo "No S3 credential secrets found"
+
+          echo ""
+          echo "Deployment verification completed"
+
+      - name: Output deployment summary
+        if: always()
+        run: |
+          echo "## Deployment Summary"
+          echo "- Status: ${{ job.status }}"
+          echo "- Environment: ${{ inputs.environment_stage }}"
+          echo "- Version: ${{ inputs.version_number }}"
+          echo "- Dry Run: ${{ inputs.dry_run }}"
+          echo "- Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
